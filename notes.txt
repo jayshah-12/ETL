@@ -1,0 +1,255 @@
+data_fetcher.py
+import json
+import importlib
+
+
+class DataFetcher:
+    def __init__(self, api_key, db_credentials, provider_name, db_type):
+        self.api_key = api_key
+        self.provider_name = provider_name
+        self.failed_offsets = []
+        self.api_calls = self.load_api_calls(provider_name)
+        self.database = self.load_database_handler(db_type, db_credentials)
+
+    def load_api_calls(self, provider_name):
+        config_file = f"providers/{provider_name}.json"
+
+        print(config_file)
+        with open(config_file) as f:
+            config = json.load(f)
+        return config['api_calls']
+
+    def load_database_handler(self, db_type, db_credentials):
+        db_select = None
+  
+        db_module = importlib.import_module(f"database.{db_type}")
+        class_name = f"{db_type.capitalize()}Database"  
+        db_class = getattr(db_module, class_name)
+        db_select = db_class(db_credentials)
+
+
+
+        return db_select
+
+    def run(self):
+       
+        provider_module = importlib.import_module(f"Fetch.{self.provider_name}")
+        fetch_data = getattr(provider_module, 'fetch_data')
+    
+
+        for api_call in self.api_calls:
+            fetch_data(self, api_call)
+
+
+
+main.py
+import os
+from dotenv import load_dotenv
+import importlib
+from data_fetcher import DataFetcher
+
+load_dotenv()
+
+provider_name = 'eia'
+db_type = 'mysql' 
+
+api_key = os.getenv(f"{provider_name}_API_KEY")
+
+db_credentials_module = importlib.import_module(f"db_credentials.{db_type}_credentials")
+db_credentials = db_credentials_module.credentials()
+
+data_fetcher = DataFetcher(api_key, db_credentials, provider_name, db_type)
+data_fetcher.run()
+
+
+
+provider/eia.json
+
+{
+    "api_calls": [
+        {
+            "url": "electricity/rto/daily-fuel-type-data/data/",
+            "params": {
+                "frequency": "daily",
+                "data[0]": "value"
+            },
+            "columns": ["period", "respondent-name", "type-name", "value", "value-units"],
+            "table_name": "a",
+            "dtype": {
+                "period": "Date",
+                "respondent-name": "String(255)",
+                "type-name": "String(255)",
+                "value": "Float",
+                "value-units": "String(50)"
+            }
+        },
+        {
+            "url": "co2-emissions/co2-emissions-aggregates/data/",
+            "params": {
+                "frequency": "annual",
+                "data[0]": "value"
+            },
+            "columns": ["period", "fuel-name", "state-name", "value", "value-units"],
+            "table_name": "b",
+            "dtype": {
+                "period": "Integer",
+                "fuel-name": "String(255)",
+                "state-name": "String(255)",
+                "value": "Float",
+                "value-units": "String(255)"
+            }
+        },
+        {
+            "url": "international/data/",
+            "params": {
+                "frequency": "annual",
+                "data[0]": "value",
+                "facets[productId][]": [116, 33, 37],
+                "facets[countryRegionId][]": "USA"
+            },
+            "columns": ["period", "productName", "activityName", "unitName", "value"],
+            "table_name": "c",
+            "dtype": {
+                "period": "Integer",
+                "productName": "String(255)",
+                "activityName": "String(255)",
+                "unitName": "String(255)",
+                "value": "Float(10)"
+            }
+        }
+    ]
+}
+
+database/base_database.py
+
+from sqlalchemy import create_engine
+import pandas as pd
+
+class BaseDatabase:
+    def insert_data(self, df, table_name):
+        """Insert data into the specified table."""
+        try:
+            df.to_sql(table_name, self.engine, if_exists='append', index=False)
+            print(f"Inserted {len(df)} records into {table_name}.")
+        except Exception as e:
+            print(f"Error inserting into {table_name}: {e}")
+
+
+database/mysql_db.py
+
+
+from sqlalchemy import create_engine
+from database.base_database import BaseDatabase
+
+class MySqlDatabase(BaseDatabase):
+    def __init__(self, credentials):
+        self.username = credentials.get('username')
+        self.password = credentials.get('password')
+        self.host = credentials.get('host')
+        self.database = credentials.get('database')
+        self.engine = self.create_engine(credentials)  
+
+    def create_engine(self, credentials):
+        """Create a SQLAlchemy engine for MySQL."""
+        return create_engine(
+            f"mysql+pymysql://{self.username}:{self.password}@{self.host}/{self.database}"
+        )
+
+
+
+
+database/snowflake_db.py
+
+
+
+from sqlalchemy import create_engine
+from database.base_database import BaseDatabase
+
+class SnowflakeDatabase(BaseDatabase):
+    def __init__(self, credentials):
+      
+        self.username = credentials.get('user')
+        self.password = credentials.get('password')
+        self.account = credentials.get('account')
+        self.database = credentials.get('database')
+        self.schema = credentials.get('schema')
+        self.engine = self.create_engine(credentials)  
+
+    def create_engine(self, credentials):
+        return create_engine(
+            f"snowflake://{self.username}:{self.password}@{self.account}/{self.database}/{self.schema}"
+        )
+
+
+Fetch/eia.py
+
+
+import pandas as pd
+import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+
+
+
+def fetch_data(self, api_call):
+    url = f"https://api.eia.gov/v2/{api_call['url']}"
+    params = api_call['params']
+    params['api_key'] = self.api_key
+    db_lock = threading.Lock()
+    try:
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        json_data = response.json()
+        total_records = int(json_data['response']['total'])
+
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            offset_map = {}
+            for offset in range(0, total_records, 5000):
+                temp_params = params.copy()
+                temp_params['offset'] = offset
+                future = executor.submit(requests.get, url, temp_params)
+                offset_map[future] = offset
+
+            for future in as_completed(offset_map):
+                offset = offset_map[future]
+                try:
+                    response = future.result()
+                    response.raise_for_status()
+                    data = response.json()
+
+                    if 'data' in data['response']:
+                        df = pd.DataFrame(data['response']['data'])
+                        if not df.empty:
+                            if 'columns' in api_call:
+                                df = df[api_call['columns']]
+                            
+                            df = df.dropna(subset=['value'])  
+                            df['value'] = pd.to_numeric(df['value'], errors='coerce')
+                            with db_lock:
+                                self.database.insert_data(df, api_call['table_name'])
+                except requests.exceptions.HTTPError:
+                    self.failed_offsets.append(offset)
+
+    except Exception as e:  
+        print(f"Error fetching data for {api_call['table_name']}: {e}")
+        self.failed_offsets.append(offset)
+
+
+capacity vs generation
+precommit check
+
+
+
+
+
+conclusion:
+In conclusion, the increasing adoption of renewable energy is having a significant and positive impact on reducing CO2 emissions over
+ time. As wind, solar, and hydro power continue to grow, their contribution to mitigating fossil fuel emissions becomes more crucial.
+  This shift to cleaner energy sources is gaining momentum, providing an encouraging outlook for a sustainable, low-carbon future.
+   With ongoing efforts to expand renewable energy capacity, we are on a clear path to combatting climate change and building a more
+    sustainable and resilient energy system for generations to come.
+
+
+
+
+intro 
